@@ -1,0 +1,8 @@
+[workspace]
+members = ["xtask", "m0"]
+default-members = ["xtask"]
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
