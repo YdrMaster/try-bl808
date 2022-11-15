@@ -12,48 +12,32 @@ const LINKER: &[u8] = b"
 OUTPUT_ARCH(RISCV)
 ENTRY(_start)
 MEMORY {
-    xip_memory  (rx)  : ORIGIN = 0x58000000, LENGTH = 32M
-    itcm_memory (rx)  : ORIGIN = 0x62028000, LENGTH = 28K
-    dtcm_memory (rx)  : ORIGIN = 0x6202F000, LENGTH = 4K
-    nocache_ram_memory (!rx) : ORIGIN = 0x22030000, LENGTH = 0K
-    ram_memory  (!rx) : ORIGIN = 0x62030000, LENGTH = 160K
-    xram_memory  (!rx) : ORIGIN = 0x40000000, LENGTH = 16K
+    xip-flash : ORIGIN = 0x58000000, LENGTH = 4M
+    ocram     : ORIGIN = 0x22020000, LENGTH = 64K
 }
-PROVIDE(stext = 0x58000000);
-
 SECTIONS {
-    .text stext : {
-        stext = .;
+    .text 0x58000000 : {
         *(.text.entry)
         *(.text .text.*)
-        . = ALIGN(4);
-        etext = .;
-    } > xip_memory
+    } > xip-flash
 
-    .rodata : ALIGN(4) {
-        srodata = .;
+    .rodata : {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
-        . = ALIGN(4);
-        erodata = .;
-    } > ram_memory
+    } > xip-flash
 
-    .data : ALIGN(4) {
-        PROVIDE( __global_pointer$ = . + 0x800 );
-        sidata = LOADADDR(.data);
-        sdata = .;
+    .data : {
         *(.data .data.*)
         *(.sdata .sdata.*)
-        . = ALIGN(4);
-        edata = .;
-    } > ram_memory
+    } > ocram
 
-    .bss (NOLOAD) : ALIGN(4) {
+    .bss (NOLOAD) : {
         *(.bss.uninit)
+        . = ALIGN(4);
         sbss = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         . = ALIGN(4);
         ebss = .;
-    } > ram_memory
+    } > ocram
 }";
