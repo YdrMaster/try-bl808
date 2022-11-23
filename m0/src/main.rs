@@ -4,8 +4,6 @@
 
 use core::mem::transmute;
 
-use bl808_pac::{glb::gpio_config, GLB};
-
 #[naked]
 #[no_mangle]
 #[link_section = ".text.entry"]
@@ -30,9 +28,13 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 extern "C" fn main() -> ! {
+    bl_uart_init(0, 14, 15, 255, 255, 2_000_000);
+
     let p = unsafe { bl808_pac::Peripherals::steal() };
 
-    // p.GLB.
+    for _ in 0..1000 {
+        p.UART0.data_write.write(|w| w.value().variant(42));
+    }
 
     p.GLB.gpio_config[8].modify(|_, w| {
         w.pin_mode()
@@ -81,156 +83,121 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-fn bl_uart_init(id: u8, tx_pin: u8, rx_pin: u8, cts_pin: u8, rts_pin: u8, baudrate: u32) {
-    const UART_CFG: UartCfg = UartCfg {
-        clk: 80_000_000,
-        baud_rate: 2_000_000,
-        data_bits: UartDataBits::Eight,
-        stop_bits: UartStopBits::One,
-        parity: UartParity::None,
-        cts_flow_control: false,
-        rx_deglitch: false,
-        rts_software_control: false,
-        tx_software_control: false,
-        tx_lin_mode: false,
-        rx_lin_mode: false,
-        tx_break_bit_cnt: 0,
-        byte_bit_inverse: ByteBitInverse::LsbFirst,
-    };
-    const FIFO_CFG: UartFifoCfg = UartFifoCfg {
-        tx_fifo_dma_threshold: 16,
-        rx_fifo_dma_threshold: 16,
-        rx_fifo_dma_enable: false,
-        tx_fifo_dma_enable: false,
-    };
-}
-
-fn uart_gpio_demo(id: u8, tx_pin: u8, rx_pin: u8, cts_pin: u8, rts_pin: u8) {
-    let mut gpio_config = GlbGpioCfgType {
-        gpio_pin: tx_pin,
-        gpio_fun: 7,
-        gpio_mode: 2,
-        pull_type: 0,
-        drive: 0,
-        smt_ctrl: 1,
-        output_mode: 0,
-    };
-    glb_uart_sig_swap_set(GlbUartSigSwapGrp::Gpio12Gpio23, 1);
-    glb_uart_sig_swap_set(GlbUartSigSwapGrp::Gpio36Gpio45, 1);
-    let fun = GlbUartSigFun::Uart0Txd;
-    let sig = uart_signal_get(gpio_config.gpio_pin);
-    glb_uart_fun_sel(sig, fun)
-}
-
-fn glb_uart_sig_swap_set(group: GlbUartSigSwapGrp, swap: u8) {
-    const GLB_PARM_CFG0_OFFSET: usize = 0x510;
-    let ptr = unsafe {
-        bl808_pac::GLB::PTR
+fn bl_uart_init(_id: u8, tx_pin: u8, rx_pin: u8, _cts_pin: u8, _rts_pin: u8, baudrate: u32) {
+    unsafe {
+        let ptr = bl808_pac::GLB::PTR
             .cast::<u8>()
-            .add(GLB_PARM_CFG0_OFFSET)
+            .add(0x510)
             .cast::<u32>()
+            .cast_mut();
+        ptr.write_volatile(ptr.read_volatile() | (1 << 3) | (1 << 5));
     };
-    let mut cfg_reg = unsafe { ptr.read_volatile() };
-    if swap != 0 {
-        cfg_reg |= 1 << (group as u32 + 2);
-    } else {
-        cfg_reg &= !(1 << (group as u32 + 2));
-    }
-    unsafe { ptr.cast_mut().write_volatile(cfg_reg) }
-}
 
-fn uart_signal_get(mut pin: u8) -> u8 {
-    //TODO no magic number is allowed here
-    if (12..=23).contains(&pin) || (36..=45).contains(&pin) {
-        pin += 6;
+    let fun = GlbUartSigFun::Uart0Txd;
+    let sig = (tx_pin as u32 + 6) % 12;
+    unsafe {
+        glb_uart_fun_sel(transmute(sig), transmute(fun));
+        glb_uart_fun_sel(transmute(fun), transmute(sig));
     }
-    pin % 12
+
+    let fun = GlbUartSigFun::Uart0Rxd;
+    let sig = (rx_pin as u32 + 6) % 12;
+    unsafe {
+        glb_uart_fun_sel(transmute(sig), transmute(fun));
+        glb_uart_fun_sel(transmute(fun), transmute(sig));
+    }
+
+    glb_set_uart_clk(true, HbnUartClk::ClkMcuPbclk, 0);
+
+    let dev = unsafe { &(*bl808_pac::UART0::PTR) };
+    // uart_disable
+    dev.transmit_config.modify(|_, w| w.function().clear_bit());
+    dev.receive_config.modify(|_, w| w.function().clear_bit());
+
+    let clk = 80_000_000;
+    let fraction = clk * 10 / baudrate % 10;
+    let mut divisor = clk / baudrate;
+    if fraction >= 5 {
+        divisor += 1;
+    }
+    dev.bit_period.write(|w| {
+        w.receive().variant((divisor - 1) as _);
+        w.transmit().variant((divisor - 1) as _)
+    });
+    dev.transmit_config.write(|w| {
+        w.parity_enable().clear_bit();
+        w.word_length().eight();
+        w.stop_bits().one();
+        w.cts().disable();
+        w.lin_transmit().disable();
+        w.break_bits().variant(0)
+    });
+    dev.receive_config.write(|w| {
+        w.parity_enable().clear_bit();
+        w.word_length().eight();
+        w.deglitch_enable().disable();
+        w.lin_receive().disable()
+    });
+    dev.data_config.write(|w| w.bit_order().clear_bit());
+    dev.signal_override.write(|w| {
+        w.rts_signal().disable();
+        w.transmit_signal().disable()
+    });
+
+    // uart_enable
+    dev.transmit_config.modify(|_, w| w.function().set_bit());
+    dev.receive_config.modify(|_, w| w.function().set_bit());
 }
 
 fn glb_uart_fun_sel(sig: GlbUartSig, fun: GlbUartSigFun) {
-    if (sig as u32) < (GlbUartSig::Eight as u32) {
-        let ptr = unsafe { (*bl808_pac::GLB::PTR).uart_signal_0.as_ptr() };
-        let mut val = unsafe { ptr.read_volatile() };
-        let sig_pos = sig as u32 * 4;
-        val &= !(0xf << sig_pos);
-        val |= (fun as u32) << sig_pos;
-        unsafe { ptr.write_volatile(val) };
+    let (ptr, sig_pos) = if (sig as u32) < (GlbUartSig::Eight as u32) {
+        (
+            unsafe { (*bl808_pac::GLB::PTR).uart_signal_0.as_ptr() },
+            sig as u32 * 4,
+        )
     } else {
-        let ptr = unsafe { (*bl808_pac::GLB::PTR).uart_signal_1.as_ptr() };
-        let mut val = unsafe { ptr.read_volatile() };
-        let sig_pos = (sig as u32 - 8) * 4;
-        val &= !(0xf << sig_pos);
-        val |= (fun as u32) << sig_pos;
-        unsafe { ptr.write_volatile(val) };
+        (
+            unsafe { (*bl808_pac::GLB::PTR).uart_signal_1.as_ptr() },
+            (sig as u32 - 8) * 4,
+        )
+    };
+    let mut val = unsafe { ptr.read_volatile() };
+    val &= !(0xf << sig_pos);
+    val |= (fun as u32) << sig_pos;
+    unsafe { ptr.write_volatile(val) };
+}
+
+fn glb_set_uart_clk(enable: bool, clk_sel: HbnUartClk, div: u8) {
+    let reg = unsafe { &(*bl808_pac::GLB::PTR).uart_config };
+    reg.modify(|_, w| w.clock_enable().clear_bit());
+    reg.modify(|_, w| w.clock_divide().variant(div));
+    hbn_set_uart_clk_sel(clk_sel);
+    if enable {
+        reg.modify(|_, w| w.clock_enable().set_bit());
     }
 }
 
-struct UartCfg {
-    clk: u32,
-    baud_rate: u32,
-    data_bits: UartDataBits,
-    stop_bits: UartStopBits,
-    parity: UartParity,
-    cts_flow_control: bool,
-    rx_deglitch: bool,
-    rts_software_control: bool,
-    tx_software_control: bool,
-    tx_lin_mode: bool,
-    rx_lin_mode: bool,
-    tx_break_bit_cnt: u8,
-    byte_bit_inverse: ByteBitInverse,
+fn hbn_set_uart_clk_sel(clk_sel: HbnUartClk) {
+    let ptr = unsafe { (*bl808_pac::HBN::PTR).global.as_ptr() };
+    let mut val = unsafe { ptr.read_volatile() };
+    match clk_sel {
+        HbnUartClk::ClkMcuPbclk => {
+            val &= !(1 << 15);
+            val &= !(1 << 2);
+        }
+        HbnUartClk::Clk160m => {
+            val &= !(1 << 15);
+            val |= 1 << 2;
+        }
+        HbnUartClk::ClkXclk => {
+            val |= 1 << 15;
+            val &= !(1 << 2);
+        }
+    }
+    unsafe { ptr.write_volatile(val) };
 }
 
-enum UartDataBits {
-    Five,
-    Six,
-    Seven,
-    Eight,
-}
-
-enum UartStopBits {
-    Half,
-    One,
-    OneAndHalf,
-    Two,
-}
-
-enum UartParity {
-    None,
-    Odd,
-    Even,
-}
-
-enum ByteBitInverse {
-    LsbFirst,
-    MsbFirst,
-}
-
-struct UartFifoCfg {
-    tx_fifo_dma_threshold: u8,
-    rx_fifo_dma_threshold: u8,
-    tx_fifo_dma_enable: bool,
-    rx_fifo_dma_enable: bool,
-}
-
-struct GlbGpioCfgType {
-    gpio_pin: u8,
-    gpio_fun: u8,
-    gpio_mode: u8,
-    pull_type: u8,
-    drive: u8,
-    smt_ctrl: u8,
-    output_mode: u8,
-}
-
-#[repr(u32)]
-enum GlbUartSigSwapGrp {
-    Gpio0Gpio11 = 0,
-    Gpio12Gpio23,
-    Gpio24Gpio35,
-    Gpio36Gpio45,
-}
-
+#[derive(Clone, Copy)]
 #[repr(u32)]
 enum GlbUartSigFun {
     Uart0Rts = 0,
@@ -262,4 +229,10 @@ enum GlbUartSig {
     Nine,
     Ten,
     Eleven,
+}
+
+enum HbnUartClk {
+    ClkMcuPbclk,
+    Clk160m,
+    ClkXclk,
 }
